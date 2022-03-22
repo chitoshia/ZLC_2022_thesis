@@ -1,0 +1,156 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Sat Mar 12 20:37:18 2022
+
+@author: Juan
+"""
+
+import datetime
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+#
+
+df=pd.read_csv(r'D:\RAW_files\20220131_Process_orders.csv')
+
+df[['acquisition_ts_est','scheduled_start_datetime','scheduled_finish_datetime']] = df[['acquisition_ts_est','scheduled_start_datetime','scheduled_finish_datetime']].apply(pd.to_datetime, format='%Y-%m-%d %H:%M:%S.%f')
+
+df = df.sort_values(['process_order', 'acquisition_ts_est'])
+
+df.drop(columns =['plant_key','resource_desc','planned_order','batch','production_version','created_date'], inplace = True)
+
+df["start_diff"]=df.groupby('process_order')['scheduled_start_datetime'].diff()
+
+df["start_diff"] = df["start_diff"].dt.total_seconds()/60/60 #turn differnece into hours
+
+df["start_diff"] = df["start_diff"].fillna(0)
+
+df['count'] = np.where(df["start_diff"]==0,0,1)
+
+final = pd.DataFrame()
+
+final = df.groupby(["process_order"])["count"].sum().reset_index(name="Count")
+
+#
+
+from datetime import datetime,date
+
+df=df.rename(columns={'acquisition_ts_est':'timestamp', 'process_order_item_plan_qty':'demand qty (EA)'})
+
+df['timestamp'] = df['timestamp'].dt.date
+
+df[['timestamp']] = df[['timestamp']].apply(pd.to_datetime, format='%Y-%m-%d')
+
+
+bom=pd.read_csv(r'D:\RAW_files\20220117_BOM.csv', sep=';')
+
+bom[['valid_from']] = bom[['valid_from']].apply(pd.to_datetime, format='%d/%m/%Y', errors='coerce')
+
+bom[['valid_to']] = bom[['valid_to']].apply(pd.to_datetime, format='%d/%m/%Y', errors='coerce')
+
+infinite = pd.to_datetime('2025-12-31')
+
+bom['valid_from'] = bom['valid_from'].fillna(infinite)
+
+bom['valid_to'] = bom['valid_to'].fillna(infinite)
+
+bom.drop(columns =['plant_key','production_version','alternative_bom','produced_quantity'], inplace = True)
+
+bom.rename(columns={'issued_quantity':'issued_quantity (for 1000EA of Material Key)'}, inplace=True)
+
+bom = bom.groupby(['valid_from', 'valid_to', 'material_key', 'bom_component_key','unit_of_measure']).sum().reset_index()
+
+
+
+
+inventory1=pd.read_csv(r'D:\RAW_files\component_inventory_batch_20220301.csv')
+
+inventory2=pd.read_csv(r'D:\RAW_files\INVENTORY_batch_extended_period.csv')
+
+inventory=inventory1.append(inventory2)
+
+inventory[['calendar_day']] = inventory[['calendar_day']].apply(pd.to_datetime, format='%Y-%m-%d %H:%M:%S.%f')
+
+
+inventory = inventory[inventory['stock_type'] == 'A']
+
+
+
+#changing the name to merge both df
+inventory = inventory.sort_values(['calendar_day']).drop(columns=['plant_key']).rename(columns={'material_key':'bom_component_key', 'quantity':'inventory', 'calendar_day':'timestamp'})
+
+merged = pd.merge(inventory,bom,how='left', on=['bom_component_key', 'unit_of_measure']).reset_index()
+
+merged = merged.groupby(['timestamp', 'valid_from', 'valid_to', 'material_key', 'bom_component_key', 'unit_of_measure', 'batch']).sum().reset_index()
+
+merged=merged[['timestamp','material_key','bom_component_key','batch', 'inventory', 'valid_from', 'valid_to','issued_quantity (for 1000EA of Material Key)', 'unit_of_measure']]
+
+merged.head(30)
+
+#
+
+all_merged = pd.merge(df,merged,how='left', on=['timestamp', 'material_key']).reset_index()
+all_merged = all_merged.sort_values(['timestamp'])
+
+
+all_merged=all_merged.groupby(['timestamp', 'material_key','process_order','scheduled_start_datetime', 'scheduled_finish_datetime', 'bom_component_key','base_unit_of_measure', 'batch']).sum()
+
+all_merged['components needed']=(all_merged['demand qty (EA)']/1000)*all_merged['issued_quantity (for 1000EA of Material Key)']
+
+all_merged=all_merged.drop(columns=['issued_quantity (for 1000EA of Material Key)', 'index'])
+
+all_merged=all_merged.rename(columns={'demand qty (EA)':'demand of material key', 'count':'delayed?', 'inventory':'inventory of components'})
+
+all_merged.reset_index(inplace=True)
+
+all_merged = all_merged[['timestamp', 'process_order', 'scheduled_start_datetime', 'scheduled_finish_datetime', 'start_diff', 'delayed?',  'material_key', 'demand of material key','bom_component_key', 'batch', 'inventory of components', 	'components needed', 'base_unit_of_measure']]
+
+all_merged.reset_index(inplace=True)
+
+all_merged['delayed? updated']=all_merged['delayed?'].apply( lambda x: '0' if x==0 else 1)
+
+all_merged['inv_difference']=all_merged['inventory of components']-all_merged['components needed']
+
+all_merged['stockout']=all_merged['inv_difference'].apply( lambda x: '0' if x>0 else 1)
+
+all_merged=all_merged.drop(columns=['delayed?'])
+
+all_merged['timestamp']=all_merged['timestamp'].dt.date
+
+
+po=pd.read_csv(r'D:\RAW_files\PO_batch_number.csv')
+
+po[['posting_date']] = po[['posting_date']].apply(pd.to_datetime, format='%Y-%m-%d')
+
+
+po['posting_date']=po['posting_date'].dt.date
+
+po=po.drop(columns=['plant_key', 'po_line'])
+
+po=po.groupby(['posting_date', 'material_key','purchase_order', 'batch', 'buom']).sum()
+
+po.reset_index(inplace=True)
+
+po=po.rename(columns={'material_key':'bom_component_key'})
+
+
+
+po_dates=pd.read_csv(r'D:\RAW_files\PURCHASE_ORDER_v2.csv')
+po_dates[['sche_line_planned_del_date']] = po_dates[['sche_line_planned_del_date']].apply(pd.to_datetime, format='%Y-%m-%d')
+po_dates[['created_date']] = po_dates[['created_date']].apply(pd.to_datetime, format='%Y-%m-%d')
+
+po_dates['Estimated_leadtime']=po_dates['sche_line_planned_del_date']-po_dates['created_date']
+
+po_dates=po_dates.rename(columns={'material_key':'bom_component_key', 'po_number':'purchase_order'})
+
+
+final_merge=pd.merge(all_merged,po,how='left', on=['batch', 'bom_component_key']).reset_index()
+
+merged_dates=pd.merge(final_merge,po_dates,how='left', on=['bom_component_key', 'purchase_order'])
+
+
+merged_dates['batch_arrival_delay']=merged_dates['posting_date']-merged_dates['sche_line_planned_del_date']
+
+merged_dates.to_csv('final_merge_3.csv')
+
