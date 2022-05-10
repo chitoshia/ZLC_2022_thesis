@@ -271,7 +271,7 @@ plot_tree(model, num_trees=0, rankdir='LR')
 plt.gcf().set_size_inches(80, 80)
 plt.show()
 
-##APPROACH 6(Work in progress): Using Lazy (like mario) predictors
+##APPROACH 6(Work in progress): Using Lazy predictors
 
 ### importing lazypredict library
 import lazypredict
