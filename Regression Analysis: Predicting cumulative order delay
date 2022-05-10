@@ -1,0 +1,288 @@
+
+
+#importing libraries
+
+import pandas as pd
+import numpy as np
+import ppscore as pps
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+#Reading file and transforming dates to daytime, transforming strings to floats...
+
+df=pd.read_csv(r'D:\RAW_files\All_Merged_Mat_Comp_Process_order_All_Merged_Mat_Comp_Process_order.csv')
+
+df[['Calendar Day', 'Scheduled Start Datetime','Scheduled Finish Datetime']] = df[['Acquisition Ts Est','Scheduled Start Datetime','Scheduled Finish Datetime']].apply(pd.to_datetime, format='%d/%m/%Y')
+
+df = df.sort_values(['Process Order', 'Calendar Day'])
+
+df['Needed Qty'] = [x.replace(',', '.') for x in df['Needed Qty']]
+
+df['Quantity Avl'] = [x.replace(',', '.') for x in df['Quantity Avl']]
+
+df['Needed Qty'] = df['Needed Qty'].astype(float)
+
+df['Quantity Avl'] = df['Quantity Avl'].astype(float)
+
+#Drop irrelevant columns for this study
+df.drop(columns =['Material Key-1','Acquisition Ts Est'], inplace = True)
+
+
+#Obtain the delay between changes in the same order, then sum them all up to get the cumulative delay per Process Order
+df["Total Delay"]=df.groupby('Process Order')['Scheduled Start Datetime'].diff()
+
+df_delays=df.groupby(['Process Order','Bom Component Key'])['Total Delay'].sum().reset_index()
+
+df_delays = df_delays.rename(columns={'Total Delay': 'Cumulative Delay'})
+
+#df['Day Of Week'] = df['Calendar Day'].dt.day_name()
+
+df_final=df
+
+df_final=df_final.groupby([Process Order','Material Key']).mean().reset_index()
+
+df_final=df_final.merge(df_delays,on=['Process Order','Bom Component Key'],how='left')
+
+df_final.drop(columns =['Material Key','Process Order','Calendar Day', 'Process Order Item Plan Qty','Scheduled Finish Datetime', 'Scheduled Start Datetime','Issued Quantity', 'Total Delay'], inplace = True)
+
+#Transform the cumulative delay to hours 
+
+df_final['Cumulative Delay'] = df_final['Cumulative Delay'].dt.total_seconds()/60/60 
+
+df_final=df_final.drop_duplicates()
+
+#Correlation matrix between numerical variables
+
+df_final.corr()
+sns.heatmap(df_final.corr())
+#Bad results, demand and inventory don't really affect the cumulative delay. This could mean that utilization is the top priority.
+
+#RunPPS Scores, a boosted correlation engine
+test = pps.matrix(df_final)
+
+#Ranking and plotting PPS Scores values
+
+test.sort_values(["x", "ppscore"], ascending=[True, False]).query('is_valid_score==True&case!="predict_itself"').round(2)
+
+for target_col in df_final.columns:
+
+    predictors_df = pps.predictors(df_final, y=target_col)
+    fig, ax = plt.subplots(figsize=(15,5))
+    sns.barplot(data=predictors_df, x="x", y="ppscore",ax=ax)
+    ax.set_title('Predictive variables for {}'.format(target_col))
+
+
+##APPROACH 1: Simple Linear Regression Model with only Numeric Variables
+
+from sklearn import metrics
+from sklearn.linear_model import LogisticRegression,LinearRegression
+from sklearn.model_selection import train_test_split
+
+
+X = df_final.drop(columns=['Cumulative Delay','Bom Component Key'])
+y = df_final['Cumulative Delay']
+
+#Split in training and testing data
+X_train, X_test, y_train, y_test = train_test_split(X, y,test_size=0.2,random_state = 25)
+
+#Fit the linear model
+model = LinearRegression()
+model.fit(X_train, y_train)
+
+
+#Test the model
+y_pred = pd.Series(model.predict(X_test))
+y_test = y_test.reset_index(drop=True)
+z = pd.concat([y_test, y_pred], axis=1)
+z.columns = ['True', 'Prediction']
+z
+
+# summarize the fit of the model
+rmse = np.sqrt(metrics.mean_squared_error(y_test,y_pred))
+print('Intercept: ',model.intercept_),
+print('Coefficients: ')
+display(pd.DataFrame(model.coef_,index=X.columns,columns=['coefficients']))
+print('RMSE: ',rmse)
+print(model.score(X_train, y_train))
+print(model.score(X_test, y_test))
+
+#So far the model is trash, RMSE=279.8 and R^2 is almost 0 and incosistent between train and test data
+#As seen in the PPS scores analysis,-
+#-categorical variables like MK and CK can explain some of the variations of Cumulative Delay
+
+
+##APPROACH 2: Simple linear regression with dummy variables
+
+X = pd.concat(
+    [
+        df_final.drop(
+            columns=['Cumulative Delay','Bom Component Key']
+        ),
+        pd.get_dummies(df_final["Bom Component Key"],prefix='Bom Component Key'),
+    ],
+    axis=1,
+)
+
+y = df_final['Cumulative Delay']
+
+#Split in training and testing data (renaming previous variables)
+X_train, X_test, y_train, y_test = train_test_split(X, y,test_size=0.2)
+
+model = LinearRegression()
+model.fit(X_train, y_train)
+
+y_pred = pd.Series(model.predict(X_test))
+y_test = y_test.reset_index(drop=True)
+z = pd.concat([y_test, y_pred], axis=1)
+z.columns = ['True', 'Prediction']
+z
+
+# summarize the fit of the model
+rmse = np.sqrt(metrics.mean_squared_error(y_test,y_pred))
+print('Intercept: ',model.intercept_),
+print('Coefficients: ')
+display(pd.DataFrame(model.coef_,index=X.columns,columns=['coefficients']))
+print('RMSE: ',rmse)
+print(model.score(X_train, y_train))
+print(model.score(X_test, y_test))
+
+#By including dummies, RMSE decreases from 280 down to 200
+#R^2 is around 0.5 and we can see consistency across training and testing data. There's no overfitting.
+
+
+##APPROACH 3: Statsmodel Ordinary Least Squares Linear Regression with dummies
+import statsmodels.api as sm
+
+model = sm.OLS(y_train,X_train).fit()
+
+model.summary()
+
+y_pred = model.predict(X_test)
+
+#calculate rmse
+rmse = np.sqrt(metrics.mean_squared_error(y_test,y_pred))
+rmse
+
+y_pred = model.predict(X_train)
+
+#calculate rmse
+rmse = np.sqrt(metrics.mean_squared_error(y_train,y_pred))
+rmse
+
+#Almost identical results as ScikitLearn's linear model, RMSE around 190 andAdjusted R^2 of 0.54
+
+
+##APPROACH 4: Decision trees
+
+from sklearn.model_selection import cross_val_score
+from sklearn.tree import DecisionTreeRegressor
+from sklearn import tree
+from sklearn import preprocessing
+
+X = df_final.drop(columns=['Cumulative Delay'])
+
+#Encoding categorical variables instead of getting dummies
+for f in X.columns:
+        if X[f].dtype == 'object':
+            lbl = preprocessing.LabelEncoder()
+            lbl.fit(list(X[f].values))
+            X[f] = lbl.transform(list(X[f].values))
+y = df_final['Cumulative Delay']
+
+
+X_train, X_test, y_train, y_test = train_test_split(X, y,test_size=0.2)
+
+regressor = DecisionTreeRegressor(max_depth=10, random_state=1234)
+cross_val_score(regressor, X_train, y_train, cv=10)
+
+regressor.fit(X_train, y_train)
+
+y_pred = regressor.predict(X_test)
+
+#calculate rmse
+rmse = np.sqrt(metrics.mean_squared_error(y_test,y_pred))
+rmse
+
+print(regressor.score(X_train, y_train))
+print(regressor.score(X_test, y_test))
+
+#Visualizing the decision tree
+fig = plt.figure(figsize=(250,200))
+_ = tree.plot_tree(regressor, feature_names=X.columns.values.tolist(), filled=True)
+
+from dtreeviz.trees import dtreeviz # remember to load the package
+
+viz = dtreeviz(regressor, X_test, y_pred,
+                target_name="Cumulative Delay",
+                feature_names=X.columns.values.tolist())
+viz
+X
+
+
+##APPROACH 5: Gradient Boosted Trees
+
+
+import xgboost as xgb
+from xgboost import XGBRegressor, XGBClassifier
+
+X = df_final.drop(columns=['Cumulative Delay'])
+
+#Encoding categorical variables instead of getting dummies
+for f in X.columns:
+        if X[f].dtype == 'object':
+            lbl = preprocessing.LabelEncoder()
+            lbl.fit(list(X[f].values))
+            X[f] = lbl.transform(list(X[f].values))
+y = df_final['Cumulative Delay']
+
+
+#Split in training and testing data (renaming previous variables)
+X_train, X_test, y_train, y_test = train_test_split(X, y,test_size=0.2,random_state=25)
+
+model = XGBRegressor()
+
+model.fit(X_train,y_train)
+
+y_pred = model.predict(X_test)
+
+model.score(X_test,y_test)
+
+model.score(X_train,y_train)
+
+#R^2=0.924 pretty good result
+
+#Measuring the actual contribution of each variable (open fi variable)
+fi = pd.DataFrame(list(zip(X.columns, 100 * model.feature_importances_))).rename(columns={0: 'Factor', 1: 'Contribution (%)'}).sort_values('Contribution (%)',ascending=False)
+rmse = np.sqrt(metrics.mean_squared_error(y_test,y_pred))
+rmse
+#RMSE gets reduced from 190 to 76, again pretty good (that's still 3 whole days of delay error)
+
+#Again contribution of each variable in F-score from xgboost library
+xgb.plot_importance(model)
+plt.rcParams['figure.figsize']=[5,5]
+plt.show()
+
+#Plot a Boosted tree
+from xgboost import plot_tree
+import os
+os.environ["PATH"] += os.pathsep + r'C:\Program Files\Graphviz\bin'
+
+plot_tree(model, num_trees=0, rankdir='LR')
+plt.gcf().set_size_inches(80, 80)
+plt.show()
+
+##APPROACH 6(Work in progress): Using Lazy (like mario) predictors
+
+### importing lazypredict library
+import lazypredict
+### importing LazyClassifier for classification problem
+from lazypredict.Supervised import LazyClassifier
+### importing LazyClassifier for classification problem because here we are solving Classification use case.
+from lazypredict.Supervised import LazyClassifier
+
+clf = LazyClassifier(verbose=0, ignore_warnings=True, custom_metric = None)
+
+### fitting data in LazyClassifier
+models,predictions = clf.fit(X_train, X_test, y_train, y_test)
+print(models)
+
